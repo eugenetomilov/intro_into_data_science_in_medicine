@@ -1,0 +1,341 @@
+---
+title: "machine_learning_in_medicine"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tidymodels)
+library(yardstick)
+
+```
+
+# перемешаем данные
+
+```{r}
+
+shuffled_iris <- iris[sample(nrow(iris)), ]
+
+```
+
+# разбиваем данные в соотношении к 0.8/0.2
+
+```{r}
+
+splitted_data <- shuffled_iris %>% initial_split(strata = Species, prop = 0.8)
+splitted_data
+
+```
+
+# выводим датафреймы в отдельные переменные
+
+```{r}
+
+train_data <- splitted_data %>% training()
+test_data <- splitted_data %>% testing()
+
+```
+
+## сравним распределения целевой переменной
+
+```{r}
+
+train_data %>% 
+  count(Species) %>%
+  mutate(n_percent = (n / sum(n)) %>% round(4) %>% `*`(100) %>% str_c("%"))
+
+```
+
+```{r}
+
+test_data %>% 
+  count(Species) %>%
+  mutate(n_percent = (n / sum(n)) %>% round(4) %>% `*`(100) %>% str_c("%"))
+
+```
+
+# создадим рецепт предварительного преобразования
+
+```{r}
+
+recipe(Species ~ ., train_data) %>%
+  step_normalize(all_predictors()) -> iris_recipe
+
+```
+
+# готовим данные к процедуре кроссвалидации
+
+```{r}
+
+folds <- vfold_cv(train_data, v = 5, repeats = 1, strata = Species, pool = 0.2)
+
+folds$splits
+
+```
+
+# готовим модель
+
+```{r}
+
+knn_model <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("kknn")
+
+knn_params <- knn_model %>%
+  parameters() %>%
+  update(neighbors = neighbors(c(1L, 5L)),
+         weight_func = weight_func(c("gaussian", "optimal", "rectangular", "triangular")))
+
+```
+
+# собираем пайплайн
+
+```{r}
+
+knn_pipeline <- workflow() %>%
+  add_model(knn_model) %>%
+  add_recipe(iris_recipe)
+
+knn_pipeline 
+
+```
+
+# кроссвалидация
+
+```{r}
+
+knn_pipeline %>%
+  tune_grid(resamples = folds,
+            grid = 5,
+            metrics = yardstick::metric_set(mn_log_loss)) -> crossval_results
+crossval_results$.metrics
+
+```
+
+# выбираем наилучшую модель
+
+```{r}
+
+best_params <- tune::select_best(crossval_results, metric = "mn_log_loss")
+
+```
+
+# финализируем пайплайн
+
+```{r}
+
+knn_pipeline %>%
+  tune::finalize_workflow(best_params) %>%
+  parsnip::fit(data = train_data) -> finalize_pipeline
+
+```
+
+# создадим набор метрик и посчитаем их для получившиъся результатов
+
+```{r}
+
+metrics_for_test <- yardstick::metric_set(yardstick::bal_accuracy,
+                                          yardstick::precision,
+                                          yardstick::recall,
+                                          yardstick::f_meas,
+                                          yardstick::sensitivity,
+                                          yardstick::specificity)
+finalize_pipeline %>%
+  predict(new_data = test_data) %>%
+  bind_cols(test_data %>% select(Species)) %>%
+  metrics_for_test(truth = Species, estimate = .pred_class)
+
+```
+
+
+```{r}
+
+metrics_for_test <- yardstick::metric_set(yardstick::bal_accuracy,
+                                          yardstick::precision,
+                                          yardstick::recall,
+                                          yardstick::f_meas,
+                                          yardstick::sensitivity,
+                                          yardstick::specificity)
+
+tibble(truth = c(rep("diseased", 5), rep("healty", 5), rep("previously ill", 5)) %>% as.factor(),
+       estimate = c(rep("diseased", 4), rep("healty", 4), rep("previously ill", 7)) %>% as.factor()) -> tibble_for_metrics
+
+
+tibble_for_metrics %>%
+  metrics_for_test(truth = truth,
+                   estimate = estimate)
+
+tibble_for_metrics %>%
+  yardstick::conf_mat(truth = truth,
+                      estimate = estimate)
+
+
+```
+
+
+
+
+```{r}
+
+original_data <- read_csv("data/raw/healthcare-dataset-stroke-data.csv") %>%
+  mutate(across(c(bmi, age, avg_glucose_level), as.numeric),
+         across(id | is.character | function(x) x %>% unique() %>% length() %>% `==`(2), as.factor)) %>%
+  select(!id)
+
+original_data %>%
+  summary()
+  
+```
+
+```{r}
+
+lm(avg_glucose_level ~ ., original_data) %>% summary()
+
+```
+
+```{r}
+
+lasso_reg <- linear_reg(penalty = 0.1, mixture = 1) %>%
+  set_engine("glmnet")
+
+recipe_reg <- recipe(avg_glucose_level ~ ., original_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+pipeline <- workflow() %>%
+  add_recipe(recipe_reg) %>%
+  add_model(lasso_reg)
+
+pipeline_fitted <- pipeline %>%
+  fit(original_data)
+
+pipeline_fitted %>%
+  extract_fit_parsnip() %>%
+  tidy()
+
+```
+
+```{r}
+
+ridge_reg <- linear_reg(penalty = 0.1, mixture = 0) %>%
+  set_engine("glmnet")
+
+recipe_reg <- recipe(avg_glucose_level ~ ., original_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+pipeline <- workflow() %>%
+  add_recipe(recipe_reg) %>%
+  add_model(ridge_reg)
+
+pipeline_fitted <- pipeline %>%
+  fit(original_data)
+
+pipeline_fitted %>%
+  extract_fit_parsnip() %>%
+  tidy()
+
+```
+
+```{r}
+
+elastic_net_reg <- linear_reg(penalty = 0.1, mixture = 0.5) %>%
+  set_engine("glmnet")
+
+recipe_reg <- recipe(avg_glucose_level ~ ., original_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+pipeline <- workflow() %>%
+  add_recipe(recipe_reg) %>%
+  add_model(elastic_net_reg)
+
+pipeline_fitted <- pipeline %>%
+  fit(original_data)
+
+pipeline_fitted %>%
+  extract_fit_parsnip() %>%
+  tidy()
+
+```
+
+```{r}
+
+logistic_reg <- logistic_reg(penalty = 0.1, mixture = 1) %>%
+  set_engine("glm")
+
+recipe_reg <- recipe(stroke ~ ., original_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+pipeline <- workflow() %>%
+  add_recipe(recipe_reg) %>%
+  add_model(logistic_reg)
+
+pipeline_fitted <- pipeline %>%
+  fit(original_data)
+
+pipeline_fitted %>%
+  extract_fit_parsnip() %>%
+  tidy()
+  
+```
+
+```{r}
+
+original_data_clean <- original_data %>% na.omit()
+
+knn_model <- nearest_neighbor(neighbors = 5, weight_func = "optimal") %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+recipe_reg <- recipe(stroke ~ ., original_data_clean) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+pipeline <- workflow() %>%
+  add_recipe(recipe_reg) %>%
+  add_model(knn_model)
+
+pipeline_fitted <- pipeline %>%
+  fit(original_data_clean)
+
+pipeline_fitted %>%
+  predict(new_data = original_data_clean) %>%
+  bind_cols(original_data_clean %>% select(stroke)) %>%
+  yardstick::conf_mat(truth = stroke,
+                      estimate = .pred_class)
+  
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
